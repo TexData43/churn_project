@@ -1,0 +1,203 @@
+---
+title: "Churn_models"
+author: "Tom"
+date: "`r format(Sys.time(), '%d %B, %Y %H:%M')`"
+output: html_document
+---
+
+### Executive Summary
+
+Tenure is the biggest driver of churn, where ~42% of customer churn occurs during the first 6 months and `r 41.9+13.5+15.7`% occurs within the first 12 months. Interestingly, `r round(41.7/41.9*100, digits = 1)`% of the customer churn in the first 6 months and `r round((41.7+13.1)/(41.9+13.5)*100, digits = 1)`% in the first 12 months are customers on a month-to-month contract. Month-to-month customers make up `r round(3875/(3875+1473+1695)*100, digits = 1)`% of the customer base, so while eliminating this type of contract is ill-advised, moving customers from a month-to-month to a one or two year contract should lead to decreased customer churn.
+
+```{r, message=FALSE, warning=FALSE, echo = F}
+library(tidyverse)
+library(caret)
+library(knitr)
+library(kableExtra)
+library(markdown)
+library(Amelia)
+library(stringr)
+library(snakecase)
+library(purrr)
+library(randomForest)
+library(ROCR)
+```
+
+### Data Preparation
+
+Read the data into R, convert all column headers to snake_case, generate segments based on spending (low, medium, high) and custumer tenure (6 month increments).
+
+```{r, echo = F}
+churn_df <- read.csv("churn_data.csv")
+
+# rename columns becuase I don't like camelcase
+# long live snakecase
+
+colnames(churn_df) <- to_any_case(colnames(churn_df), case = "snake")
+#churn_df <- churn_df %>% mutate(monthly_spend = monthly_charges, tenure_length = tenure)
+
+# generate a duplicate column of monthly_spend
+churn_df <- churn_df %>% mutate(monthly_spend = monthly_charges, tenure_segment = tenure)
+
+
+tenure_seg <- function(tenure){
+  if (tenure >= 0 && tenure <= 6) {
+    return('0-6 Month')
+  }else if(tenure > 6 && tenure <= 12){
+    return('6-12 Month')
+  }else if (tenure > 12 && tenure <= 24){
+    return('12-24 Month')
+  }else if (tenure > 24 && tenure <= 36){
+    return('24-36 Month')
+  }else if (tenure > 36 && tenure <= 48){
+    return('36-48 Month')
+  }else if (tenure > 48 && tenure <= 60){
+    return('48-60 Month')
+  }else if (tenure > 60){
+    return('> 60 Month')
+  }
+}
+
+# apply tenure_seg function on each row of dataframe
+# churn_df$tenure_segment <- sapply(churn_df$tenure_segment, tenure_seg)
+
+churn_df$tenure_segment <- sapply(churn_df$tenure,tenure_seg)
+churn_df$tenure_segment <- as.factor(churn_df$tenure_segment)
+churn_df$tenure_segment <- factor(churn_df$tenure_segment, levels(churn_df$tenure_segment)[c(2, 7, 3:6, 1)])
+
+month_seg <- function(monthly_charges){
+    if (monthly_charges >= 0 && monthly_charges <= 40){
+        return('Low Spend')
+    }else if(monthly_charges > 40 && monthly_charges <= 80){
+        return('Medium Spend')
+    }else if (monthly_charges >= 80 && monthly_charges > 80){
+        return('High Spend')
+    }
+}
+
+# apply tenure_seg function on each row of dataframe
+# churn_df$monthly_charges <- sapply(churn_df$monthly_charges, month_seg)
+
+churn_df$monthly_spend <- sapply(churn_df$monthly_charges,month_seg)
+churn_df$monthly_spend <- as.factor(churn_df$monthly_spend)
+churn_df$monthly_spend <- factor(churn_df$monthly_spend, levels(churn_df$monthly_spend)[c(2, 3, 1)])
+```
+
+#### Convert to binary coding
+  Multiple lines, online security, online backup, device proteciton, tech support, streaming tv, streaming movies are converted to a yes/no binary code (exclude "no internet/phone service" as a code).
+
+```{r, echo = F}
+### Convert multiple columns to text
+cols_character <- c("multiple_lines", "online_security", "online_backup", "device_protection", "tech_support", "streaming_tv", "streaming_movies")
+cols_internet <- c("online_security", "online_backup", "device_protection", "tech_support", "streaming_tv", "streaming_movies")
+churn_df[cols_character] <- sapply(churn_df[cols_character], as.character)
+
+# Replace No phone service and no internet service with "No"
+churn_df$multiple_lines <- str_replace(churn_df$multiple_lines, "No phone service", "No")
+churn_df[cols_internet] <- data.frame(lapply(churn_df[cols_internet], function(x) {
+  str_replace(x, "No internet service", "No")}))
+churn_df[cols_character] <- data.frame(lapply(churn_df[cols_character], as.factor))
+```
+
+```{r, echo = F}
+# Generate churn % summary data segmented by monthly segments
+churn_segment_summary <- churn_df %>% 
+  group_by(churn, tenure_segment) %>% 
+  summarise(n = n()) %>% spread(churn, n) %>% 
+  mutate(churn_percent_total = round(Yes/(nrow(filter(churn_df, churn == "Yes")))*100, digits = 1), churn_percent_segment = round(Yes/(Yes + No)*100, digits = 1))
+
+churn_table <- churn_segment_summary %>% select(tenure_segment, churn_percent_segment, churn_percent_total) %>% rename(`Tenure Segment` = tenure_segment, `% Churn by Segment` = churn_percent_segment, `% Churn by Total Churn` = churn_percent_total)
+
+```
+```{r, echo = F}
+# Generate churn % summary data segmented by monthly segments
+churn_billing_summary <- churn_df %>% 
+  group_by(churn, tenure_segment, contract) %>% 
+  summarise(n = n()) %>% spread(churn, n) %>% 
+  mutate(churn_percent_total = round(Yes/(nrow(filter(churn_df, churn == "Yes")))*100, digits = 1), churn_percent_segment = round(Yes/(Yes + No)*100, digits = 1))
+
+```
+
+### Generate summary data
+We can see that the vast majority (`r churn_table[1,3] + churn_table[2,3]`%) of the customer churn occurs during the 1st 12 months
+
+```{r, echo = F}
+kable(churn_table, format = "html", booktabs = T)
+```
+
+```{r, echo = F}
+set.seed(37)
+train_index <- createDataPartition(churn_df$churn, p = .6, list = F, times = 1)
+churn_train <- churn_df[ train_index, ]
+churn_test <- churn_df[-train_index, ]
+dim(churn_train)
+dim(churn_test)
+```
+
+```{r, echo = F}
+model1 <- glm(churn ~ gender + tenure + phone_service + internet_service + contract + paperless_billing + monthly_spend, family = binomial("logit"), data = churn_train)
+
+
+print(summary(model1))
+
+predict_results <- predict(model1, newdata = churn_test, type = "response")
+fitted_results <- ifelse(predict_results > 0.5, 1, 0)
+churn_test$churn <- as.character(churn_test$churn)
+churn_test$churn[churn_test$churn == "No"] <- "0"
+churn_test$churn[churn_test$churn== "Yes"] <- "1"
+
+misclassification_error <- mean(fitted_results != churn_test$churn)
+print(misclassification_error)
+
+
+accuracy <- table(predict_results, churn_test[,"churn"])
+sum(diag(accuracy))/sum(accuracy)
+
+accuracy_rate <- 1-misclassification_error
+print(accuracy_rate)
+
+```
+
+
+```{r, echo = F}
+table(churn_test$churn, predict_results > 0.5)
+```
+
+```{r}
+model2 <- glm(churn ~ tenure + contract + paperless_billing + monthly_spend, family = binomial("logit"), data = churn_train)
+
+print(summary(model2))
+
+predict_results <- predict(model2, newdata = churn_test, type = "response")
+fitted_results <- ifelse(predict_results > 0.5, 1, 0)
+churn_test$churn <- as.character(churn_test$churn)
+churn_test$churn[churn_test$churn == "No"] <- "0"
+churn_test$churn[churn_test$churn== "Yes"] <- "1"
+
+misclassification_error <- mean(fitted_results != churn_test$churn)
+print(misclassification_error)
+
+
+accuracy <- table(predict_results, churn_test[,"churn"])
+sum(diag(accuracy))/sum(accuracy)
+
+accuracy_rate <- 1-misclassification_error
+print(accuracy_rate)
+```
+
+```{r, echo = F}
+table(churn_test$churn, predict_results > 0.5)
+```
+```{r}
+set.seed(88)
+split_churn <- (train$Recommended, SplitRatio = 0.75)
+
+```
+
+```{r}
+churn_rf <- randomForest(as.factor(churn)~ tenure + contract + paperless_billing + monthly_spend, data = churn_train, ntree = 5000, importance = T)
+
+importance(churn_rf)
+```
+
+
